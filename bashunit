@@ -1,0 +1,464 @@
+#!/bin/bash
+## USAGE:  bashunit [FILE1] [FILE2] ...
+## All test files must end in "test" and must be of type "shell script"
+## If no test file is specified, bashunit searches in the current directory tree
+## In each test file, bashunit runs every function whose name begins with "test"
+## Tests may use the built-in "fail" and assertion functions
+## (see list at the end of thie file)
+## If a function "before_test" is defined, this will be executed before every test function
+
+############################################################
+#               INITIALIZATION                             #
+############################################################
+function _sh_unit_which_or_fail() {
+  local path="$(which "$1")"
+  if test -z "$path"; then
+    echo "Could not find $1: exiting" >&2
+    exit 1
+  fi
+  echo "$path"
+}
+
+function _sh_unit_init_vars() {
+  _SH_UNIT_BASH_EXEC="$(_sh_unit_which_or_fail bash)"
+  _SH_UNIT_CAT_EXEC="$(_sh_unit_which_or_fail cat)"
+  _SH_UNIT_DIRNAME_EXEC="$(_sh_unit_which_or_fail dirname)"
+  _SH_UNIT_FIND_EXEC="$(_sh_unit_which_or_fail find)"
+  _SH_UNIT_GREP_EXEC="$(_sh_unit_which_or_fail grep)"
+  _SH_UNIT_MKDIR_EXEC="$(_sh_unit_which_or_fail mkdir)"
+  _SH_UNIT_PS_EXEC="$(_sh_unit_which_or_fail ps)"
+  _SH_UNIT_RM_EXEC="$(_sh_unit_which_or_fail rm)"
+  _SH_UNIT_SETSID_EXEC="$(which setsid)" ## setsid is optional
+  _SH_UNIT_THIS_FILE="$(cd "$(${_SH_UNIT_DIRNAME_EXEC} "$BASH_SOURCE")"; pwd)/bashunit"
+  _SH_UNIT_TMPDIR=/tmp/_bashunit
+  _SH_UNIT_MAX_STACK_TRACE=30
+  export _SH_UNIT_SUCCESS=SUCCESS
+  export _SH_UNIT_FAILURE=FAILURE
+  _sh_unit_status_file_name=status
+  _sh_unit_error_message_file_name=error_message
+  _sh_unit_exit_code_file_name=exit_code
+  _sh_unit_stdout_file_name=stdout
+  _sh_unit_stderr_file_name=stderr
+  _sh_unit_assertions_file_name=assertions
+}
+  
+function _sh_unit_init_tests() {
+  ${_SH_UNIT_RM_EXEC} -fr $_SH_UNIT_TMPDIR && ${_SH_UNIT_MKDIR_EXEC} -p $_SH_UNIT_TMPDIR || {
+    echo "ERROR: Could not initialize"
+    exit 1
+  }
+  test -d $_SH_UNIT_TMPDIR || {
+    echo "ERROR: could not create $_SH_UNIT_TMPDIR"
+    exit 1
+  }
+  test -z "$( ${_SH_UNIT_FIND_EXEC} $_SH_UNIT_TMPDIR -mindepth 1 )" || {
+    echo "ERROR: could not clean up $_SH_UNIT_TMPDIR"
+    exit 1
+  }
+}
+
+############################################################
+#               INTERNAL UTILITIES                         #
+############################################################
+function _sh_unit_invoke_function_if_exists() {
+  local function="$1"
+  if declare -F "$function" >/dev/null; then
+    ## export any variables that are set
+    set -a
+    eval "$function"
+    set +a
+  fi
+}
+
+function _sh_unit_kill_other_processes_with_specified_env() {
+  exclude="$1"
+  key="$2"
+  val="$3"
+  ${_SH_UNIT_PS_EXEC} eww | ${_SH_UNIT_GREP_EXEC} "${key}=${val}" | while read p rest; do
+    if ! test "$p" == "$exclude"; then
+      kill $p 2>/dev/null
+    fi
+  done
+}
+
+function _sh_unit_print_stack_trace() {
+  ## start at 1 so we don't include this method (_sh_unit_print_stack_trace)
+  ## Also simplifies LINENO
+  for ((i=1; i<$_SH_UNIT_MAX_STACK_TRACE; i++)); do
+    local sourcefile=${BASH_SOURCE[$i]}
+    local function=${FUNCNAME[$i]}
+    local lineno=${BASH_LINENO[$i-1]}
+    if test -z "${sourcefile}${function}"; then
+      break
+    else
+      echo "at ${sourcefile}:${lineno} ($function) "
+    fi
+  done
+}
+
+############################################################
+#               RUNNING TESTS                              #
+############################################################
+function _sh_unit_run_test() {
+  export _sh_unit_test_name="$1"
+  export file="$2"  ## source the file again to get decent stacktraces
+  if test -z "$_sh_unit_test_name"; then
+    echo "ERROR: Test name is empty"
+    return 1
+  fi
+  if echo -n "$_sh_unit_test_name" | ${_SH_UNIT_GREP_EXEC} -q -P "\s"; then
+    echo "ERROR: Test name '$_sh_unit_test_name' contains whitespace"
+    return 1
+  fi
+  if test -z "$file"; then
+    echo "ERROR: File name is empty"
+    return 1
+  fi
+  export _sh_unit_test_dir="$_SH_UNIT_TMPDIR/$_sh_unit_test_name"
+  if test -e "$_sh_unit_test_dir"; then
+    echo "ERROR: $_sh_unit_test_dir already found:  are you running the same test twice?"
+    return 1
+  fi
+  ${_SH_UNIT_MKDIR_EXEC} -p "$_sh_unit_test_dir" || {
+    echo "ERROR: Unable to create directory '$_sh_unit_test_dir'"
+    return 1
+  }
+  export _sh_unit_status_file="$_sh_unit_test_dir/$_sh_unit_status_file_name"
+  export _sh_unit_error_message_file="$_sh_unit_test_dir/$_sh_unit_error_message_file_name"
+  export _sh_unit_exit_code_file="$_sh_unit_test_dir/$_sh_unit_exit_code_file_name"
+  export _sh_unit_stdout_file="$_sh_unit_test_dir/$_sh_unit_stdout_file_name"
+  export _sh_unit_stderr_file="$_sh_unit_test_dir/$_sh_unit_stderr_file_name"
+  export _sh_unit_assertions_file="$_sh_unit_test_dir/$_sh_unit_assertions_file_name"
+  (
+    export _sh_unit_pid=$BASHPID
+    trap "_sh_unit_kill_other_processes_with_specified_env $_sh_unit_pid _sh_unit_pid $_sh_unit_pid" SIGUSR2
+    (
+      local cmds=(
+        "source \"$_SH_UNIT_THIS_FILE\"; "
+        "source \"$file\" 2>/dev/null; "
+        "_sh_unit_init_vars; "
+        "_sh_unit_invoke_function_if_exists before_test; "
+        "$_sh_unit_test_name; "
+        "echo \$? > $_sh_unit_exit_code_file"
+      )
+
+      ## If possible, run the test in a new session, to minimize the possiblity that it
+      ## might kill the master test process
+      if test -n "$_sh_unit_verbose"; then
+         ${_SH_UNIT_SETSID_EXEC} ${_SH_UNIT_BASH_EXEC} -x -c "${cmds[*]}"
+      else
+         ${_SH_UNIT_SETSID_EXEC} ${_SH_UNIT_BASH_EXEC} -c "${cmds[*]}"
+      fi
+    ) > "$_sh_unit_stdout_file" 2>&1 &
+    wait $!
+  )
+  if test -e "$_sh_unit_error_message_file"; then
+    echo $_SH_UNIT_FAILURE > $_sh_unit_status_file
+  elif ! test -e $_sh_unit_exit_code_file; then
+    echo $_SH_UNIT_FAILURE > $_sh_unit_status_file
+    echo "No exit status: did test die?" > $_sh_unit_error_message_file
+  elif test "$(${_SH_UNIT_CAT_EXEC} $_sh_unit_exit_code_file)" != "0"; then
+    echo $_SH_UNIT_FAILURE > $_sh_unit_status_file
+    echo "Test exited with status $(${_SH_UNIT_CAT_EXEC} $_sh_unit_exit_code_file)" > $_sh_unit_error_message_file
+  elif ! test -e "$_sh_unit_assertions_file"; then
+    echo $_SH_UNIT_FAILURE > $_sh_unit_status_file
+    echo "No assertions made" > $_sh_unit_error_message_file
+  else
+    echo $_SH_UNIT_SUCCESS > $_sh_unit_status_file
+  fi
+
+  local status="$(${_SH_UNIT_CAT_EXEC} $_sh_unit_status_file 2>/dev/null)"
+  local message="$(${_SH_UNIT_CAT_EXEC} $_sh_unit_error_message_file 2>/dev/null)"
+  case "$status" in
+    "$_SH_UNIT_SUCCESS")
+       if test -n "$_sh_unit_verbose"; then
+         echo "$_sh_unit_test_name PASSED"
+       fi
+       return 0
+       ;;
+
+    "$_SH_UNIT_FAILURE")
+      if test -n "$_sh_unit_verbose"; then
+        echo -e "\n$_sh_unit_test_name FAILED: $message\n"
+      else
+        echo -e "\n$_sh_unit_test_name: $message\n"
+      fi
+      return 1
+      ;;
+
+    *) echo "Unexpected status '$status'.  Something went wrong in $_sh_unit_test_name"; return 1;;
+  esac
+}
+
+############################################################
+#               SUMMARIZING RESULTS                        #
+############################################################
+function _sh_unit_summarize_results() {
+  echo
+  echo
+  echo "SUMMARY:"
+  local total=0
+  local passed=0
+  local failed=0
+  for test_dir in $($_SH_UNIT_FIND_EXEC $_SH_UNIT_TMPDIR -maxdepth 1 -mindepth 1 -type d | sort); do
+    local test_name="$(basename "$test_dir")"
+    local test_status="$(${_SH_UNIT_CAT_EXEC} $test_dir/$_sh_unit_status_file_name 2>/dev/null)"
+    local test_message="$(${_SH_UNIT_CAT_EXEC} $test_dir/$_sh_unit_error_message_file_name 2>/dev/null)"
+    let "total++"
+    case "$test_status" in
+      "$_SH_UNIT_SUCCESS")   let "passed++" ;;
+      "$_SH_UNIT_FAILURE")   let "failed++" ;;
+      *) echo "Unexpected status '$status' for test '$test_name'.  Something went wrong";;
+    esac
+  done
+  echo -n "Ran $total tests.  "
+  echo -n "$passed passed.  "
+  echo -n "$failed failed."
+  echo
+  echo "For more information on the test run, look in $_SH_UNIT_TMPDIR"
+  test "$total" == 0 && echo "WARNING: RAN NO TESTS"
+  echo
+  ## Return 0 if we ran at least one test and all tests passed
+  test "$total" -gt 0 && test "$failed" == 0
+}
+
+############################################################
+#               INVOCATION                                 #
+############################################################
+function _sh_unit_print_warnings() {
+  if test "$(uname)" == "Darwin"; then
+    echo "WARNING: BASH on OSX is buggy.  Tests may fail unepectedly"
+  fi
+}
+
+function _sh_unit_find_test_files() {
+  local args=$@
+  if test -z "$args"; then
+    args="."
+  fi
+
+  for arg in $args; do
+    $_SH_UNIT_FIND_EXEC $arg -type f -name "*test"
+  done
+}
+
+function _sh_unit_invoke_from_command_line() {
+  _sh_unit_init_vars
+  _sh_unit_init_tests
+  _sh_unit_print_warnings
+  
+  for _bashunit_file in $(_sh_unit_find_test_files $@); do
+    if (file $_bashunit_file | grep "shell script") >/dev/null 2>/dev/null; then
+      echo "Validating $_bashunit_file ..."
+      if bash -n "$_bashunit_file" >/dev/null 2>/dev/null; then
+        echo "Running tests from $_bashunit_file"
+    
+        (
+          source "$_bashunit_file" 2>/dev/null
+          declare -F | while read _bashunit_decl _bashunit_args _bashunit_function_name; do
+            if echo "$_bashunit_function_name" | grep -P "^test" >/dev/null; then
+              if _sh_unit_run_test "$_bashunit_function_name" "$_bashunit_file"; then
+                echo -n "."
+              else
+                echo -n "F"
+              fi
+            fi
+          done
+        )
+        echo
+      else
+        echo "$_bashunit_file failed syntax validation"
+        exit 1
+      fi
+    fi
+  done
+  
+  _sh_unit_summarize_results
+}
+
+############################################################
+#               HANDLING FAILURE                           #
+############################################################
+function _sh_unit_record_assertion() {
+  echo "${FUNCNAME[1]} $@" >> $_sh_unit_assertions_file
+}
+
+function fail() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_msg="$1"
+  if test -z "$(${_SH_UNIT_CAT_EXEC} $_sh_unit_status_file 2>/dev/null)"; then
+    echo "$_SH_UNIT_FAILURE" > $_sh_unit_status_file
+    echo "$_sh_unit_msg" > $_sh_unit_error_message_file
+    _sh_unit_print_stack_trace >> $_sh_unit_error_message_file
+    kill -USR2 $_sh_unit_pid
+  fi
+  false
+}
+
+############################################################
+#               ASSERTIONS                                 #
+############################################################
+function assert_equals() {
+  _sh_unit_record_assertion "$@"
+  local _sh_unit_expected="$1"
+  local _sh_unit_actual="$2"
+  local _sh_unit_msg="$3"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  if ! test "$_sh_unit_expected" == "$_sh_unit_actual"; then
+    fail "${_sh_unit_msg}expected
+ '$_sh_unit_expected'
+    but was
+ '$_sh_unit_actual'"
+  fi
+  true
+}
+
+function assert_contains() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_expected="$1"
+  local _sh_unit_actual="$2"
+  local _sh_unit_msg="$3"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  echo "$_sh_unit_actual" | ${_SH_UNIT_GREP_EXEC} -F -q "$_sh_unit_expected" || {
+    fail "${_sh_unit_msg}Value '$_sh_unit_actual' was expected to contain '$_sh_unit_expected', but did not"
+  }
+  true
+}
+
+function assert_does_not_contain() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_expected="$1"
+  local _sh_unit_actual="$2"
+  local _sh_unit_msg="$3"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  echo "$_sh_unit_actual" | ${_SH_UNIT_GREP_EXEC} -F -q "$_sh_unit_expected" && {
+    fail "${_sh_unit_msg}Value '$_sh_unit_actual' was not expected to contain '$_sh_unit_expected', but did"
+  }
+  true
+}
+
+function assert_matches() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_expected="$1"
+  local _sh_unit_actual="$2"
+  local _sh_unit_msg="$3"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  echo "$_sh_unit_actual" | ${_SH_UNIT_GREP_EXEC} -P -q "$_sh_unit_expected" || {
+    fail "${_sh_unit_msg}Value '$_sh_unit_actual' was expected to match regexp '$_sh_unit_expected', but did not"
+  }
+  true
+}
+
+function assert_array_equals() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_expected_array="$1"
+  local _sh_unit_actual_array="$2"
+  local _sh_unit_msg="$3"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  assert_true "declare -p $_sh_unit_expected_array | ${_SH_UNIT_GREP_EXEC} -F -q 'declare -a $_sh_unit_expected_array'" "$_sh_unit_expected_array not an array"
+  assert_true "declare -p $_sh_unit_actual_array | ${_SH_UNIT_GREP_EXEC} -F -q 'declare -a $_sh_unit_actual_array'" "$_sh_unit_actual_array not an array"
+  local _sh_unit_e_size="$(eval "echo \${#$_sh_unit_expected_array[*]}")"
+  local _sh_unit_a_size="$(eval "echo \${#$_sh_unit_actual_array[*]}")"
+  assert_equals "$_sh_unit_e_size" "$_sh_unit_a_size" "Arrays $_sh_unit_expected_array and $_sh_unit_actual_array differ in length"
+  for ((i=0; i<_sh_unit_e_size; i++)); do
+    assert_equals "$(eval 'echo ${'"$_sh_unit_expected_array"'["$i"]}')" "$(eval 'echo ${'"$_sh_unit_actual_array"'["$i"]}')"  "Arrays $_sh_unit_expected_array and $_sh_unit_actual_array differ at index $i"
+  done
+  true
+}
+
+function assert_succeeds() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_cmd="$1"
+  local _sh_unit_msg="$2"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  eval "$_sh_unit_cmd" || {
+    fail "${_sh_unit_msg}Command '${_sh_unit_cmd}' was expected to succeed, but failed with exit code $?"
+  }
+  true
+}
+
+function assert_true() {
+  assert_succeeds "$1" "$2"
+}
+
+function assert_fails() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_cmd="$1"
+  local _sh_unit_msg="$2"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  eval "$_sh_unit_cmd" && {
+    fail "${_sh_unit_msg}Command '${_sh_unit_cmd}' was expected to fail, but succeeded"
+  }
+  true
+}
+
+function assert_false() {
+  assert_fails "$1" "$2"
+}
+
+function assert_exit_value_equals() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_expected_exit_value="$1"
+  local _sh_unit_cmd="$2"
+  local _sh_unit_msg="$3"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  eval "$_sh_unit_cmd"
+  local _sh_actual_exit_value=$?
+  assert_equals "$_sh_unit_expected_exit_value" "$_sh_unit_expected_exit_value" \
+      "${_sh_unit_msg}Unexpected exit value from command '${_sh_unit_cmd}'"
+  true
+}
+
+function assert_file_does_not_exist() {
+  _sh_unit_record_assertion "$@"
+
+  local _sh_unit_file="$1"
+  local _sh_unit_msg="$2"
+  test -n "$_sh_unit_msg" && _sh_unit_msg="$_sh_unit_msg: "
+  if test -e "$_sh_unit_file"; then
+    fail "${_sh_unit_msg}${_sh_unit_file} was not expected to exist, but did"
+  fi
+  true
+}
+
+############################################################
+#               HELPER FUNCTIONS                           #
+############################################################
+function get_bashunit_tmpfile() {
+  local _sh_unit_name="$1"
+  if test -z "$_sh_unit_name"; then
+    fail "get_bashunit_tmpfile() called without _sh_unit_name"
+  fi
+  local _sh_unit_file="$_sh_unit_test_dir/$_sh_unit_name"
+  ${_SH_UNIT_MKDIR_EXEC} -p "$(${_SH_UNIT_DIRNAME_EXEC} "$_sh_unit_file")"
+  echo "$_sh_unit_file"
+}
+
+############################################################
+#               EXPORTED FUNCTIONS                         #
+############################################################
+export -f fail
+export -f assert_equals
+export -f assert_contains
+export -f assert_does_not_contain
+export -f assert_matches
+export -f assert_succeeds
+export -f assert_fails
+export -f assert_exit_value_equals
+export -f assert_file_does_not_exist
+export -f get_bashunit_tmpfile
+
+############################################################
+#               RUN TESTS IF NOT SOURCED                   #
+############################################################
+if test "$(basename "$0")" == "bashunit"; then
+  _sh_unit_invoke_from_command_line "$@"
+fi
